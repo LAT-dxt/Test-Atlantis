@@ -6,3 +6,7 @@ locals {
 locals {
   atlantis_pr_test_marker_2 = "trigger-1775112496"
 }
+
+locals {
+  pr_manual_test_marker = "manual-1775114359"
+}
