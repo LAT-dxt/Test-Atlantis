@@ -1,0 +1,40 @@
+project_name  = "atlantis"
+environment   = "prod"
+aws_region    = "ap-southeast-1"
+
+ingress_mode   = "nginx" # nginx | cloudflare_quick_tunnel | cloudflare_named_tunnel
+atlantis_domain = "atlantis.example.com"
+
+# Required in nginx mode: paste PEM content (multiline heredoc)
+tls_cert_pem = <<CERT
+-----BEGIN CERTIFICATE-----
+REPLACE_ME
+-----END CERTIFICATE-----
+CERT
+
+tls_key_pem = <<KEY
+-----BEGIN PRIVATE KEY-----
+REPLACE_ME
+-----END PRIVATE KEY-----
+KEY
+
+# Required in cloudflare_named_tunnel mode only
+cloudflare_named_tunnel_token = null
+
+ssh_allowed_cidrs = ["YOUR_PUBLIC_IP/32"]
+allowed_web_cidrs = ["0.0.0.0/0"]
+
+github_owner_allowlist = [
+  "github.com/your-org/*"
+]
+
+github_user = "your-github-bot"
+
+# Store secrets in SSM SecureString before apply
+github_token_ssm_name          = "/atlantis/prod/github_token"
+github_webhook_secret_ssm_name = "/atlantis/prod/github_webhook_secret"
+
+# Optionally attach extra policy so Atlantis can create your infra resources
+atlantis_extra_iam_policy_arns = [
+  "arn:aws:iam::aws:policy/AdministratorAccess"
+]

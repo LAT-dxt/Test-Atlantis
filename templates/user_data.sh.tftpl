@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee /var/log/atlantis-bootstrap.log | logger -t atlantis-bootstrap -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg lsb-release unzip jq nginx awscli
+
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+cat >/etc/apt/sources.list.d/docker.list <<EOF_DOCKER_REPO
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable
+EOF_DOCKER_REPO
+
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+
+mkdir -p /opt/atlantis /var/lib/atlantis /etc/atlantis
+chown -R ubuntu:ubuntu /opt/atlantis /var/lib/atlantis /etc/atlantis
+chown -R 100:100 /var/lib/atlantis
+
+GH_TOKEN=$(aws ssm get-parameter --name "${github_token_ssm_name}" --with-decryption --region "${aws_region}" --query 'Parameter.Value' --output text)
+GH_WEBHOOK_SECRET=$(aws ssm get-parameter --name "${github_webhook_secret_ssm_name}" --with-decryption --region "${aws_region}" --query 'Parameter.Value' --output text)
+
+cat >/opt/atlantis/atlantis.env <<EOF_ENV
+ATLANTIS_GH_USER=${github_user}
+ATLANTIS_GH_TOKEN=$${GH_TOKEN}
+ATLANTIS_GH_WEBHOOK_SECRET=$${GH_WEBHOOK_SECRET}
+ATLANTIS_REPO_ALLOWLIST=${github_owner_allowlist}
+ATLANTIS_ATLANTIS_URL=${atlantis_public_url}
+ATLANTIS_REPO_LOCKING=${enable_repo_level_locking}
+EOF_ENV
+
+chmod 600 /opt/atlantis/atlantis.env
+
+cat >/opt/atlantis/atlantis.yaml <<'EOF_ATLANTIS_YAML'
+repos:
+  - id: /.*/
+    apply_requirements: [approved, mergeable]
+    allowed_overrides: [workflow, apply_requirements]
+    allow_custom_workflows: true
+workflows:
+  default:
+    plan:
+      steps:
+        - init
+        - plan
+    apply:
+      steps:
+        - apply
+EOF_ATLANTIS_YAML
+
+cat >/opt/atlantis/docker-compose.yml <<'EOF_COMPOSE'
+services:
+  atlantis:
+    image: ghcr.io/runatlantis/atlantis:${atlantis_version}
+    container_name: atlantis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4141:4141"
+    env_file:
+      - /opt/atlantis/atlantis.env
+    command: >
+      server
+      --port=4141
+      --repo-config=/etc/atlantis/atlantis.yaml
+      --data-dir=/atlantis
+      --default-tf-version=${terraform_version}
+      --autoplan-file-list=**/*.tf,**/*.tfvars,**/*.hcl
+    volumes:
+      - /var/lib/atlantis:/atlantis
+      - /opt/atlantis/atlantis.yaml:/etc/atlantis/atlantis.yaml:ro
+EOF_COMPOSE
+
+if [ "${ingress_mode}" = "nginx" ]; then
+  mkdir -p /etc/nginx/ssl
+  echo "${tls_cert_pem_base64}" | base64 -d >/etc/nginx/ssl/atlantis.crt
+  echo "${tls_key_pem_base64}" | base64 -d >/etc/nginx/ssl/atlantis.key
+  chmod 600 /etc/nginx/ssl/atlantis.key
+
+  cat >/etc/nginx/sites-available/atlantis <<EOF_NGINX
+server {
+  listen 443 ssl;
+  server_name ${atlantis_domain};
+
+  ssl_certificate     /etc/nginx/ssl/atlantis.crt;
+  ssl_certificate_key /etc/nginx/ssl/atlantis.key;
+  ssl_protocols       TLSv1.2 TLSv1.3;
+
+  client_max_body_size 10m;
+
+  location / {
+    proxy_pass http://127.0.0.1:4141;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP \$remote_addr;
+  }
+}
+EOF_NGINX
+
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf /etc/nginx/sites-available/atlantis /etc/nginx/sites-enabled/atlantis
+  nginx -t
+  systemctl enable --now nginx
+fi
+
+if [ "${ingress_mode}" = "cloudflare_quick_tunnel" ] || [ "${ingress_mode}" = "cloudflare_named_tunnel" ]; then
+  wget -O /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+  dpkg -i /tmp/cloudflared.deb
+
+  if [ "${ingress_mode}" = "cloudflare_quick_tunnel" ]; then
+    cat >/etc/systemd/system/cloudflared.service <<'EOF_CLOUDFLARED_QUICK'
+[Unit]
+Description=Cloudflare Quick Tunnel for Atlantis
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:4141
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_CLOUDFLARED_QUICK
+  else
+    cat >/etc/systemd/system/cloudflared.service <<EOF_CLOUDFLARED_NAMED
+[Unit]
+Description=Cloudflare Named Tunnel for Atlantis
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${cloudflare_named_tunnel_token}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_CLOUDFLARED_NAMED
+  fi
+
+  systemctl daemon-reload
+  systemctl enable --now cloudflared
+fi
+
+cp /opt/atlantis/atlantis.yaml /etc/atlantis/atlantis.yaml
+
+cd /opt/atlantis
+docker compose up -d
