@@ -87,7 +87,7 @@ variable "atlantis_domain" {
   default     = ""
 
   validation {
-    condition     = var.ingress_mode == "cloudflare_quick_tunnel" || length(trim(var.atlantis_domain)) > 0
+    condition     = var.ingress_mode == "cloudflare_quick_tunnel" || length(trimspace(var.atlantis_domain)) > 0
     error_message = "atlantis_domain is required for nginx and cloudflare_named_tunnel modes."
   }
 }
